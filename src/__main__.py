@@ -13,7 +13,7 @@ def main() -> None:
         default='data/input/functions_definition.json',
     )
     parser.add_argument('--input', default='data/input/function_calling_tests.json')
-    parser.add_argument('--output', default='data/output/function_calls.json')
+    parser.add_argument('--output', default='data/output/function_calling_results.json')
     args = parser.parse_args()
 
     functions = load_functions(args.functions_definition)
