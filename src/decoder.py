@@ -117,23 +117,29 @@ def _select_function(
     prompt: str,
     functions: List[Any],
 ) -> str:
-    """Score each function by how likely its description continues the prompt."""
+    """Select function by mean log-prob per token of its name."""
     best_name: Optional[str] = None
     best_score = float('-inf')
+    fn_list = '\n'.join(
+        f'- {fn.name}: {fn.description}' for fn in functions
+    )
+    base = (
+        f'Available functions:\n{fn_list}\n\n'
+        f'User request: "{prompt}"\n'
+        f'Answer with only the function name.\n'
+        f'Function: '
+    )
+    context_ids = model.encode(base)[0].tolist()
     for fn in functions:
-        # Score the description tokens given the prompt — better semantic match
-        desc_ids = model.encode(fn.description)[0].tolist()
-        context_ids = model.encode(
-            f'User request: "{prompt}"\n'
-            f'This request is best handled by a function that: '
-        )[0].tolist()
+        fn_ids = model.encode(fn.name)[0].tolist()
         score = 0.0
         ids = list(context_ids)
-        for token_id in desc_ids:
+        for token_id in fn_ids:
             logits = model.get_logits_from_input_ids(ids)
             score += logits[token_id]
             ids.append(token_id)
-        score /= len(desc_ids)
+        # normalize by number of tokens to avoid length bias
+        score = score / len(fn_ids)
         if score > best_score:
             best_score = score
             best_name = fn.name
