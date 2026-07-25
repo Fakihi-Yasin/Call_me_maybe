@@ -77,11 +77,22 @@ def _gen_number(
 
     result = ''
     ids = list(input_ids)
+    has_dot = False
     for _ in range(max_tokens):
         next_id = _best(model, ids, valid_ids)
+        tok = _tok(next_id, id_to_token).strip()
         if next_id in term:
             break
-        result += _tok(next_id, id_to_token).strip()
+        if tok == '.':
+            if has_dot:
+                break
+            has_dot = True
+        elif has_dot and tok.isdigit():
+            break  # stop before decimal digits — keep integer part only
+        candidate = result + tok
+        if not re.match(r'^-?[0-9]*\.?[0-9]*([eE][+-]?[0-9]*)?$', candidate):
+            break
+        result += tok
         ids.append(next_id)
     try:
         return float(result) if result else 0.0
@@ -103,24 +114,30 @@ def _gen_boolean(
 
 def _select_function(
     model: Small_LLM_Model,
-    input_ids: List[int],
-    fn_names: List[str],
+    prompt: str,
+    functions: List[Any],
 ) -> str:
-    """Score each function name by summing token log-probs; return best."""
+    """Score each function by how likely its description continues the prompt."""
     best_name: Optional[str] = None
     best_score = float('-inf')
-    for fn_name in fn_names:
-        fn_ids = model.encode(fn_name)[0].tolist()
+    for fn in functions:
+        # Score the description tokens given the prompt — better semantic match
+        desc_ids = model.encode(fn.description)[0].tolist()
+        context_ids = model.encode(
+            f'User request: "{prompt}"\n'
+            f'This request is best handled by a function that: '
+        )[0].tolist()
         score = 0.0
-        ids = list(input_ids)
-        for token_id in fn_ids:
+        ids = list(context_ids)
+        for token_id in desc_ids:
             logits = model.get_logits_from_input_ids(ids)
             score += logits[token_id]
             ids.append(token_id)
+        score /= len(desc_ids)
         if score > best_score:
             best_score = score
-            best_name = fn_name
-    return best_name if best_name is not None else fn_names[0]
+            best_name = fn.name
+    return best_name if best_name is not None else functions[0].name
 
 
 def generate_constrained_call(
@@ -147,30 +164,21 @@ def generate_constrained_call(
         f'(params: {", ".join(f"{k}:{v.type}" for k, v in fn.parameters.items())})'
         for fn in functions
     )
-    base_prompt = (
-        f'Available functions:\n{fn_descriptions}\n\n'
-        f'User request: {prompt}\n\n'
-    )
 
     # Step 1: select function name
-    select_ids = model.encode(
-        base_prompt
-        + 'Choose the single most appropriate function name from the list above'
-        + ' that best matches the user request. Answer with only the function name: '
-    )[0].tolist()
-    fn_name = _select_function(model, select_ids, [fn.name for fn in functions])
+    fn_name = _select_function(model, prompt, functions)
 
     # Step 2: extract arguments
     chosen = next(fn for fn in functions if fn.name == fn_name)
     parameters: Dict[str, Any] = {}
 
-    for param_name, param_def in chosen.parameters.items():
-        arg_prompt = (
-            base_prompt
-            + f'Function to call: {fn_name}\n'
-            + f'Value for "{param_name}" ({param_def.type}): '
-        )
-        arg_ids = model.encode(arg_prompt)[0].tolist()
+    param_items = list(chosen.parameters.items())
+    for i, (param_name, param_def) in enumerate(param_items):
+        position = f'the {["first", "second", "third"][i]} argument' if i < 3 else f'argument {i+1}'
+        arg_ids = model.encode(
+            f'User request: "{prompt}"\n'
+            f'From the user request above, {position} ("{param_name}", {param_def.type}) is: '
+        )[0].tolist()
 
         if param_def.type in ('number', 'integer', 'float'):
             parameters[param_name] = _gen_number(

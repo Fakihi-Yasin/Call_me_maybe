@@ -41,6 +41,7 @@ def run_pipeline(
         except Exception as e:
             print(f"  Error processing prompt: {e}")
 
+    import os; os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         json.dump([r.model_dump() for r in results], f, indent=2)
     print(f"\nOutput written to {output_path}")
