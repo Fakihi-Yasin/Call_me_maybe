@@ -51,13 +51,19 @@ def _gen_string(
     ]
     result = ''
     ids = list(input_ids)
+    seen: List[int] = []
     for _ in range(max_tokens):
         next_id = _best(model, ids, valid_ids)
         if next_id == quote_id:
             break
+        # stop on repetition: detect repeated patterns of length 1-4
+        seen.append(next_id)
+        for pat_len in range(1, 5):
+            if len(seen) >= pat_len * 2 and seen[-pat_len:] == seen[-pat_len * 2:-pat_len]:
+                return result.strip()
         result += _tok(next_id, id_to_token)
         ids.append(next_id)
-    return result
+    return result.strip()
 
 
 def _gen_number(
@@ -112,34 +118,43 @@ def _gen_boolean(
     return next_id in true_ids
 
 
+def _score_tokens(
+    model: Small_LLM_Model,
+    prefix_ids: List[int],
+    target_ids: List[int],
+) -> float:
+    """Return mean log-prob of target_ids given prefix_ids."""
+    score = 0.0
+    ids = list(prefix_ids)
+    for token_id in target_ids:
+        logits = model.get_logits_from_input_ids(ids)
+        score += logits[token_id]
+        ids.append(token_id)
+    return score / len(target_ids)
+
+
 def _select_function(
     model: Small_LLM_Model,
     prompt: str,
     functions: List[Any],
 ) -> str:
-    """Select function by mean log-prob per token of its name."""
+    """Select function by scoring both name and description against the prompt."""
     best_name: Optional[str] = None
     best_score = float('-inf')
-    fn_list = '\n'.join(
-        f'- {fn.name}: {fn.description}' for fn in functions
-    )
-    base = (
-        f'Available functions:\n{fn_list}\n\n'
-        f'User request: "{prompt}"\n'
-        f'Answer with only the function name.\n'
-        f'Function: '
-    )
-    context_ids = model.encode(base)[0].tolist()
     for fn in functions:
-        fn_ids = model.encode(fn.name)[0].tolist()
-        score = 0.0
-        ids = list(context_ids)
-        for token_id in fn_ids:
-            logits = model.get_logits_from_input_ids(ids)
-            score += logits[token_id]
-            ids.append(token_id)
-        # normalize by number of tokens to avoid length bias
-        score = score / len(fn_ids)
+        # Score description: how well does this function's purpose match the request?
+        desc_score = _score_tokens(
+            model,
+            model.encode(f'Task: "{prompt}"\nWhat to do: ')[0].tolist(),
+            model.encode(fn.description)[0].tolist(),
+        )
+        # Score name: how likely is this name to follow the prompt directly?
+        name_score = _score_tokens(
+            model,
+            model.encode(f'Task: "{prompt}"\nFunction name: ')[0].tolist(),
+            model.encode(fn.name)[0].tolist(),
+        )
+        score = desc_score + name_score
         if score > best_score:
             best_score = score
             best_name = fn.name
@@ -165,12 +180,6 @@ def generate_constrained_call(
     Returns:
         Dict with 'name' and 'parameters' keys.
     """
-    fn_descriptions = '\n'.join(
-        f'- {fn.name}: {fn.description} '
-        f'(params: {", ".join(f"{k}:{v.type}" for k, v in fn.parameters.items())})'
-        for fn in functions
-    )
-
     # Step 1: select function name
     fn_name = _select_function(model, prompt, functions)
 
@@ -180,10 +189,12 @@ def generate_constrained_call(
 
     param_items = list(chosen.parameters.items())
     for i, (param_name, param_def) in enumerate(param_items):
-        position = f'the {["first", "second", "third"][i]} argument' if i < 3 else f'argument {i+1}'
         arg_ids = model.encode(
+            f'Function: {chosen.name}\n'
+            f'Description: {chosen.description}\n'
             f'User request: "{prompt}"\n'
-            f'From the user request above, {position} ("{param_name}", {param_def.type}) is: '
+            f'Extract only the value of "{param_name}" from the user request above.\n'
+            f'"{param_name}": '
         )[0].tolist()
 
         if param_def.type in ('number', 'integer', 'float'):
